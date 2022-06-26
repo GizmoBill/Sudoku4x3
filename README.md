@@ -4,20 +4,20 @@ of a 12x12 Sudoku grid with 4x3 boxes.
 
 The original exact count was done in 2006 by Kjell Fredrik Pettersen of Norway and Bill Silver
 (this author) of the USA. Pettersen created the enumeration methods and wrote a complete,
-functional implementation. I examined the primary loops made significant impovements in speed,
+functional implementation. I examined the primary loops and made significant impovements in speed,
 primarily reordering the memory access pattern for better data cache performance. Together
-we run the code on up to six computers in Norway and Massachusetts. The result was obtained in
+we ran the code on up to six computers in Norway and Massachusetts. The result was obtained in
 2568 hours of CPU time, and has never been independently verified until now.
 
-The current code is a completely original, independent, design and implementation. I did not
+The current code is a completely original, independent design and implementation. I did not
 and do not have more than a superficial understanding of Pettersen's methods and implementation,
 and I did not look at any 2006 source code in 2022. Furthermore, examination of the 2006
 intermediate data and count files, and comparison with the 2022 alternatives, shows very
 significant differences in the methods. These differences are described in the source code
 comments, and the comparisons can be run by the code itself.
 
-The present enumeration methods are described in source code comments (imperfectly no doubt),
-as well as C++ template programming techniques designed to improve programming reliability.
+The present enumeration methods are described in source code comments (imperfectly no doubt);
+also described are C++ template programming techniques designed to improve programming reliability.
 The code is not intended to meet professional style and documentation standards.
 
 Pettersen's method is more sophisticated and efficient than mine. I had the enormous advantage
@@ -39,7 +39,7 @@ has lots of capabilities, and is pretty efficient.)
 
 The following copyright notice is embeded in the source code:
 
-// COPYRIGHT (C) 2022 BILL SILVER OF NOBLEBORO ME. I GRANT YOU A NONEXCLUSIVE
-// LICENSE TO DO AS YOU PLEASE WITH THE FOLLOWING SOURCE CODE AT YOUR OWN RISK,
-// AS LONG AS YOU INCLUDE THIS COPYRIGHT NOTICE IN COPIES OR DERIVED WORKS MADE
-// FROM PORTIONS OR THE ENTIRETY OF THE CODE.
+COPYRIGHT (C) 2022 BILL SILVER OF NOBLEBORO ME. I GRANT YOU A NONEXCLUSIVE
+LICENSE TO DO AS YOU PLEASE WITH THE FOLLOWING SOURCE CODE AT YOUR OWN RISK,
+AS LONG AS YOU INCLUDE THIS COPYRIGHT NOTICE IN COPIES OR DERIVED WORKS MADE
+FROM PORTIONS OR THE ENTIRETY OF THE CODE.
