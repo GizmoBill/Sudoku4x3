@@ -18,6 +18,7 @@
 // also provides high-performance searching and sorting of the list of codes, and is used for
 // purposes beyond computing histograms.
 
+#include "general.h"
 #include <cassert>
 #include <string>
 #include <vector>

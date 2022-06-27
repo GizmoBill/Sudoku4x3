@@ -320,7 +320,7 @@ BoxCode<COL>::BoxCode(const BoxSets<COL>& sets)
 //
 // A RowSets = BoxSets<false> is four sets, each containing three elements drawn from the
 // twelve symbols. Being sets, order doesn't matter, since we are only considering
-// influence of other boxes in the band. Likewise, a ColSets = BoxSets<true> is three
+// influence on other boxes in the band. Likewise, a ColSets = BoxSets<true> is three
 // sets of four elements. Sets are represented as 12-bit fields in a uint64_t. With
 // this representation, compatibility checking is trivial and extremely fast.
 //
@@ -1537,7 +1537,7 @@ void BoxCompatible<COL>::verify()
 // gangCode_, which has to actually consider lots of permutations. The actual numbers
 // vary slightly when running multiple parallel threads, due to variations in the
 // order in which gangsters are found and the cache is filled. Note that cache filling
-// is thread-safe because in multiple threads try to fill the same cache element, they
+// is thread-safe because if multiple threads try to fill the same cache element, they
 // will be writing the same value and so write order doesn't matter.
 
 // Determined emperically by Pettersen in 2006, verified here (the code finds the
@@ -1778,7 +1778,7 @@ private:
   //
   // The cache holds different values over time.
   //    * initialized to -1 (no gangsters found)
-  //    * temporary index issued in order of finding, or -1 of not yet found
+  //    * temporary index issued in order of finding, or -1 if not yet found
   //    * code order index after all gangsters found
   //    * bandCounts for grid counting
   // The temporary find-order index is stored in gangMembers_ during finding. This list is
@@ -2658,7 +2658,6 @@ void BandGang::countAll(std::vector<Gangster>& gang) const
           break;
       }
 
-      fclose(file);
       ProfileTree::stop();
     }
   }
@@ -3304,6 +3303,8 @@ int PCountFinder::baseIndex_(int top, int bot)
 void PCountFinder::find(std::vector<Gangster>& gangsters)
 {
   const std::filesystem::path path{ "C:/Users/bsilv/Documents/VStudio Projects/bignum2/Sudoku4x3/4x3/final" };
+  int files = 0;
+
   for (auto const& file : std::filesystem::directory_iterator{ path })
   {
     std::string filename = file.path().filename().u8string();
@@ -3319,6 +3320,7 @@ void PCountFinder::find(std::vector<Gangster>& gangsters)
       int duplicates = 0;
       int mismatches = 0;
       int k = -1;
+      ++files;
 
       while (true)
       {
@@ -3395,6 +3397,8 @@ void PCountFinder::find(std::vector<Gangster>& gangsters)
       in.close();
     }
   }
+
+  printf("%d Pettersen count files read\n", files);
 
   std::vector<PGang> pGang;
   readPGang(pGang);

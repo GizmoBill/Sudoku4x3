@@ -11,6 +11,7 @@
 
 #include "profile.h"
 #include "general.h"
+#include <stdexcept>
 
 namespace BillGeneral
 {
@@ -23,8 +24,9 @@ namespace BillGeneral
   bool ProfileTree::active_ = false;
 
   ProfileTree::TreeNode::TreeNode(int parent, const char* tag)
-    : parent_(parent), siblings_(-1), children_(-1),
-      tag_(tag), elapsedSec_(0), iterations_(0)
+    : tag_(tag), elapsedSec_(0), iterations_(0),
+	  parent_(parent), siblings_(-1), children_(-1)
+
   {
   }
 

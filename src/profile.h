@@ -14,6 +14,7 @@
 
 #include <chrono>
 #include <vector>
+#include <string>
 
 namespace BillGeneral
 {
