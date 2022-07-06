@@ -54,7 +54,7 @@ namespace BillGeneral
   {
     double s = 0;
     for (int kid = children_; kid >= 0; kid = tree_[kid].siblings_)
-      s += tree_[kid].elapsedSec_ + tree_[kid].childrenSec();
+      s += tree_[kid].elapsedSec_/* + tree_[kid].childrenSec()*/;
     return s;
   }
 
@@ -64,16 +64,16 @@ namespace BillGeneral
 
     std::string s = strFormat("%*s%*s", indent, "", indent - tagWidth, tag_);
     if (iterations_ > 1)
-      s += strFormat("%9llu * %11.4f -> ", iterations_, elapsedSec_ / iterations_ * 1.0e6);
+      s += strFormat("%9llu * %13.4f -> ", iterations_, elapsedSec_ / iterations_ * 1.0e6);
     else
-      s += "                           ";
+      s += "                             ";
     s += strFormat("%7.3f\n", elapsedSec_);
 
     for (int kid = children_; kid >= 0; kid = tree_[kid].siblings_)
       s += tree_[kid].toString(indent + 2);
 
     if (children_ >= 0)
-      s += strFormat("%*s%*s                           %7.3f\n",
+      s += strFormat("%*s%*s                             %7.3f\n",
                      indent + 2, "", indent + 2 - tagWidth, "Overhead", overheadSec());
 
     return s;

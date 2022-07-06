@@ -28,6 +28,9 @@
 #include <profile.h>
 #include <rope.h>
 #include <general.h>
+#include <symmetrytable.h>
+
+#include "sudokuda.h"
 
 #include <mutex>
 #include <fstream>
@@ -126,79 +129,6 @@ std::string commas(uint64_t n)
 
   return s;
 }
-
-// ********************
-// *                  *
-// *  Symmetry Table  *
-// *                  *
-// ********************
-//
-// A 2D Dim * Dim table of type T, where the value at (x, y) and (y, x) are the same.
-// The !Small version uses Dim * Dim * sizeof(T) bytes, storing the same value at (x, y)
-// and (y, x). The Small version uses Dim * (Dim + 1) / 2 * sizeof(T) bytes, storing
-// only one value for (x, y) and (y, x). The idea is that while it takes a little
-// longer to compute the address of the value in the Small version, the use of less
-// memory shoud improve data cache performance. Emperically, the !Small version is
-// faster in this application.
-
-template<typename T, uint32_t Dim, bool Small>
-class SymTable
-{
-public:
-  const T& get(uint32_t x, uint32_t y) const { return table_[x][y]; }
-
-  // Set new value and return previous value
-  T set(uint32_t x, uint32_t y, const T& value)
-  {
-    T v = table_[x][y];
-    table_[x][y] = table_[y][x] = value;
-    return v;
-  }
-
-  void setAll(const T& value)
-  {
-    for (uint32_t i = 0; i < Dim; ++i)
-      for (uint32_t j = 0; j < Dim; ++j)
-        table_[i][j] = value;
-  }
-
-private:
-  T table_[Dim][Dim];
-};
-
-// Specialization for Small
-template<typename T, uint32_t Dim>
-class SymTable<T, Dim, true>
-{
-public:
-  const T& get(uint32_t x, uint32_t y) const { return table_[address_(x, y)]; }
-
-  // Set new value and return previous value
-  T set(uint32_t x, uint32_t y, const T& value)
-  {
-    T& vRef = table_[address_(x, y)];
-    T v = vRef;
-    vRef = value;
-    return v;
-  }
-
-  void setAll(const T& value)
-  {
-    for (int i = 0; i < size_; ++i)
-      table_[i] = value;
-  }
-
-private:
-  static constexpr size_t size_ = (size_t)Dim * (Dim + 1) / 2;
-  T table_[size_];
-
-  static size_t address_(uint32_t x, uint32_t y)
-  {
-    uint32_t u = std::min(x, y);
-    uint32_t v = std::max(x, y);
-    return (((uint64_t)v * (v + 1)) >> 1) + u;
-  }
-};
 
 // ***************
 // *             *
@@ -2445,7 +2375,7 @@ void BandGang::membersIteration_(int b1, int threadIndex)
 {
   ColCode box1(b1);
   ColCode box0 = rename(box1, ColCode(0));
-  const BandGang::CacheLevel& cache = gangCache_[ColNode::nodes(box0).repIndex];
+  const CacheLevel& cache = gangCache_[ColNode::nodes(box0).repIndex];
 
   int gangIndex = cache.get(0, 0);
   ++tempMembers_[threadIndex][gangIndex];
@@ -2773,7 +2703,7 @@ class GridCounter
 {
 public:
   // Initialize internal gangser-independent table
-  GridCounter(const BandGang& gang);
+  GridCounter(const BandGang& gang, bool gpuEnable);
 
   // Count all gangsters in specified one of the 9 GangSets, using specified number of
   // threads, appending results as found to file countFileBase_gangSetMark.txt, where
@@ -2808,22 +2738,21 @@ private:
   bool verifyMode_;
   bool countBackwards_;
   int countSkip_;
+  bool gpuEnable_;
 
-  // Big tables
+  // Big tables. See comments in sudokuda.h
   ColCode codeCompatTable_[ColCode::Count][ColCompatible::Count][2];
-  uint8_t cacheTable_[DoubleBoxCount];
-  uint8_t multiplier_[DoubleBoxCount];
-  ColCode doubleRenameTable_[DoubleBoxCount][ColCode::Count];
-  int32_t otherBandIndex_[DoubleBoxCount];
+  GridCountPacket gcPackets[DoubleBoxCount];
 
   void setup_(int gangSetIndex);
+  bool packetOrder_(const GridCountPacket& gcp0, const GridCountPacket& gcp1) const;
   void readCountFile_();
   void countIteration_(int gangCode, int threadIndex);
   void printMultiplierHist_() const;
 };
 
-GridCounter::GridCounter(const BandGang& gang)
-  : gang_(gang)
+GridCounter::GridCounter(const BandGang& gang, bool gpuEnable)
+  : gang_(gang), gpuEnable_(gpuEnable)
 {
   ProfileTree::start("Construct GridCounter");
 
@@ -2840,6 +2769,16 @@ GridCounter::GridCounter(const BandGang& gang)
   }
 
   ProfileTree::stop(ColCode::Count * ColCompatible::Count);
+
+#ifdef JETSON
+  if (gpuEnable)
+  {
+    ProfileTree::start("Give band counts to GPU");
+    cudaCache((int32_t (*)[ColCode::Count][ColCode::Count])&gang.cache(0),
+              (uint16_t(*)[ColCompatibleCount][2])codeCompatTable_);
+    ProfileTree::stop(9 * ColCode::Count * ColCode::Count);
+  }
+#endif
 }
 
 void GridCounter::readCountFile_()
@@ -2877,6 +2816,33 @@ void GridCounter::readCountFile_()
          countFile_.c_str(), totalTime_ / 3600.0);
 }
 
+bool GridCounter::packetOrder_(const GridCountPacket& gcp0, const GridCountPacket& gcp1) const
+{
+  int level00 = gcp0.cacheLevel;
+  int level01 = gcPackets[gcp0.otherIndex].cacheLevel;
+  sort(level00, level01);
+
+  int level10 = gcp1.cacheLevel;
+  int level11 = gcPackets[gcp1.otherIndex].cacheLevel;
+  sort(level10, level11);
+
+  if (gcp0.multiplier == 0)
+    return false;
+  if (gcp1.multiplier == 0)
+    return true;
+
+  if (level00 < level10)
+    return true;
+  if (level00 == level10)
+  {
+    if ((level00 & 1) == 0)
+      return level01 < level11;
+    else
+      return level01 > level11;
+  }
+  return false;
+}
+
 void GridCounter::setup_(int gangSetIndex)
 {
   ProfileTree::start("GridCounter Setup");
@@ -2890,10 +2856,11 @@ void GridCounter::setup_(int gangSetIndex)
   readCountFile_();
 
   // Make tables
+  ProfileTree::start("Big tables");
   ColCode box1 = ColNode::nodeList[gangSetIndex];
 
-  for (uint32_t i = 0; i < DoubleBoxCount; ++i)
-    otherBandIndex_[i] = -1;
+  for (GridCountPacket& gcp : gcPackets)
+    gcp.otherIndex = -1;
 
   int di = 0;
   for (int c0 = 0; c0 < ColCompatible::Count; ++c0)
@@ -2916,19 +2883,21 @@ void GridCounter::setup_(int gangSetIndex)
       ColCode box4a = gang_.rename(box5, box4);
       ColCode box5a = gang_.rename(box4a, ColCode(0));
 
-//      ColCode box8a = gang_.rename(box9, box8);
-//      ColCode box9a = gang_.rename(box8a, ColCode(0));
+      // ColCode box8a = gang_.rename(box9, box8);
+      // ColCode box9a = gang_.rename(box8a, ColCode(0));
+
+      GridCountPacket& gcp = gcPackets[di];
 
       size_t cacheIndex;
       if (ColNode::nodeList.lookup(box5a, cacheIndex))
-        cacheTable_[di] = (uint8_t)cacheIndex;
+        gcp.cacheLevel = (uint8_t)cacheIndex;
       else
         throw std::runtime_error("Can't find cache index");
 
       for (ColCode cx(0); cx.isValid(); ++cx)
-        doubleRenameTable_[di][cx()] = gang_.rename(box4a, gang_.rename(box5, cx));
+        gcp.doubleRename[cx()] = gang_.rename(box4a, gang_.rename(box5, cx))();
 
-      multiplier_[di] = (uint8_t)(box4 <= box8) + (uint8_t)(box4 < box8);        
+      gcp.multiplier = (uint8_t)(box4 <= box8) + (uint8_t)(box4 < box8);
 
       std::vector<int> x1;
       for (int i = 0; i < ColCompatible::Count; ++i)
@@ -2941,9 +2910,9 @@ void GridCounter::setup_(int gangSetIndex)
         for (int b1 : x1)
         {
           int otherIndex = b0 * ColCompatible::Count + b1;
-          if (otherBandIndex_[otherIndex] == -1)
+          if (gcPackets[otherIndex].otherIndex == -1)
           {
-            otherBandIndex_[otherIndex] = di;
+            gcPackets[otherIndex].otherIndex = di;
             goto otherOK;
           }
         }
@@ -2951,8 +2920,50 @@ void GridCounter::setup_(int gangSetIndex)
     otherOK:;
     }
   }
-
   ProfileTree::stop(DoubleBoxCount);
+
+  ProfileTree::start("Sort");
+
+  // Sort for preferred run order. multiply 0 elements must all be after the others.
+  // This is an expensive sort because the elements are so big, but we don't care. Hope the memory
+  // use is O(1), not O(N)
+  for (int i = 0; i < DoubleBoxCount; ++i)
+    gcPackets[i].originalIndex = i;
+  std::sort(gcPackets, gcPackets + DoubleBoxCount,
+            [&](const GridCountPacket& gcp0, const GridCountPacket& gcp1) { return packetOrder_(gcp0, gcp1); });
+
+  // Fix the otherIndex values
+  struct IndexPair
+  {
+    int32_t original, runOrder;
+    IndexPair() = default;
+    IndexPair(int32_t original, int32_t runOrder) : original(original), runOrder(runOrder) {}
+    bool operator<(const IndexPair& ip) const { return original < ip.original; }
+  };
+  std::vector<IndexPair> indexMap(DoubleBoxCount);
+  for (int32_t i = 0; i < DoubleBoxCount; ++i)
+    indexMap[i] = IndexPair(gcPackets[i].originalIndex, i);
+  std::sort(indexMap.begin(), indexMap.end());
+  for (GridCountPacket& gcp : gcPackets)
+  {
+    auto p = std::lower_bound(indexMap.begin(), indexMap.end(), IndexPair(gcp.otherIndex, 0));
+    if (p == indexMap.end() || p->original != gcp.otherIndex)
+      throw std::runtime_error("GridCountPacket sort error");
+    gcp.otherIndex = p->runOrder;
+  }
+
+  ProfileTree::stop();
+
+#ifdef JETSON
+  if (gpuEnable_)
+  {
+    ProfileTree::start("Tables -> GPU");
+    cudaSetup(gcPackets);
+    ProfileTree::stop();
+  }
+#endif
+
+  ProfileTree::stop();
 }
 
 void GridCounter::countIteration_(int gangOffset, int threadIndex)
@@ -2978,44 +2989,55 @@ void GridCounter::countIteration_(int gangOffset, int threadIndex)
 
   ColCode box2 = BandGang::box2(gangCode);
   ColCode box3 = BandGang::box3(gangCode);
-  ColCode box7[ColCompatible::Count], box11[ColCompatible::Count];
+  uint16_t box7[ColCompatible::Count], box11[ColCompatible::Count];
 
   uint64_t count = 0;
 
+#ifdef JETSON
+  if (gpuEnable_ && threadIndex == 0)
+    count = cudaCount(box2(), box3());
+  else
+#endif
+
   for (uint32_t box01 = 0; box01 < DoubleBoxCount; ++box01)
   {
-    if (multiplier_[box01] == 0)
-      continue;
+    const GridCountPacket& gcp0 = gcPackets[box01];
 
-    const BandGang::CacheLevel* band1Cache = &gang_.cache(cacheTable_[                box01] );
-    const BandGang::CacheLevel* band2Cache = &gang_.cache(cacheTable_[otherBandIndex_[box01]]);
+    if (gcp0.multiplier == 0)
+      break;
+
+    int box01Other = gcp0.otherIndex;
+    const GridCountPacket& gcp1 = gcPackets[box01Other];
+
+    const BandGang::CacheLevel* band1Cache = &gang_.cache(gcp0.cacheLevel);
+    const BandGang::CacheLevel* band2Cache = &gang_.cache(gcp1.cacheLevel);
 
     for (int b3 = 0; b3 < ColCompatible::Count; ++b3)
     {
-      box7[b3]  = codeCompatTable_[box3()][b3][0];
-      box11[b3] = codeCompatTable_[box3()][b3][1];
+      int b7  = codeCompatTable_[box3()][b3][0]();
+      int b11 = codeCompatTable_[box3()][b3][1]();
 
-      box7[b3]  = doubleRenameTable_[                box01 ][box7 [b3]()];
-      box11[b3] = doubleRenameTable_[otherBandIndex_[box01]][box11[b3]()];
+      box7 [b3] = gcp0.doubleRename[b7 ];
+      box11[b3] = gcp1.doubleRename[b11];
     }
 
     uint64_t partialCount = 0;
     for (int b2 = 0; b2 < ColCompatible::Count; ++b2)
     {
-      ColCode box6  = codeCompatTable_[box2()][b2][0];
-      ColCode box10 = codeCompatTable_[box2()][b2][1];
+      int box6  = codeCompatTable_[box2()][b2][0]();
+      int box10 = codeCompatTable_[box2()][b2][1]();
 
-      box6  = doubleRenameTable_[                box01 ][box6 ()];
-      box10 = doubleRenameTable_[otherBandIndex_[box01]][box10()];
+      box6  = gcp0.doubleRename[box6 ];
+      box10 = gcp1.doubleRename[box10];
 
       // This is the inner loop, executed 1.04e15 times. Two sequential memory fetches (excellent
       // data cache locality). Two memory references from the gangCache, good but not excellent locality.
       // One 64-bit multiply-accumulate.
       for (int b3 = 0; b3 < ColCompatible::Count; ++b3)
-        partialCount += (uint64_t)band1Cache->get(box6(), box7[b3]()) * band2Cache->get(box10(), box11[b3]());
+        partialCount += (uint64_t)band1Cache->get(box6, box7[b3]) * band2Cache->get(box10, box11[b3]);
     }
 
-    count += partialCount * multiplier_[box01];
+    count += partialCount * gcp0.multiplier;
   }
 
   double threadTime = timer.elapsedSeconds() / threadCount_;
@@ -3063,6 +3085,8 @@ void GridCounter::countIteration_(int gangOffset, int threadIndex)
 void GridCounter::count(int gangSet, int threads, const std::string& countFileBase,
                         bool verify, bool countBackwards, int countStartOffset)
 {
+  ProfileTree::start("Grid counter");
+
   countFile_ = countFileBase + "_" + std::to_string(gangSet);
   if (countBackwards)
     countFile_ += '-';
@@ -3080,16 +3104,23 @@ void GridCounter::count(int gangSet, int threads, const std::string& countFileBa
   setup_(gangSet);
   //printMultiplierHist_();
 
-  Rope<GridCounter> rope(this, &GridCounter::countIteration_);
-  rope.run(gset.count, threads);
-  fprintf(stderr, "\n");
+  if (threads >= 0)
+  {
+    ProfileTree::start("Main count loop");
+    Rope<GridCounter> rope(this, &GridCounter::countIteration_);
+    rope.run(gset.count, threads);
+    ProfileTree::stop(gset.count - countSkip_);
+    fprintf(stderr, "\n");
+  }
+
+  ProfileTree::stop();
 }
 
 void GridCounter::printMultiplierHist_() const
 {
   IList h;
-  for (uint8_t m : multiplier_)
-    h.enter(m);
+  for (const GridCountPacket& gcp : gcPackets)
+    h.enter(gcp.multiplier);
   h.print("Grid count multipliers");
 }
 
@@ -3492,9 +3523,11 @@ static const char* commandline()
     "         <dir>      optional '-' for count backwards\n"
     "         <basefile> Optional, default is \"gridCount\". Count file will be\n"
     "                    <basefile>_g<set><dir>.txt\n"
+    "  G      enable GPU"
     "  k<setOffset> If g is given, begin grid counting at <setOffset> within the GridSet,\n"
     "         and work forward or backward from there\n"
     "  m      compute gangMembers (can also be read from file with r and verified)\n"
+    "  N      Skip the grid counting\n"
     "  p<w>   read Pettersen gangsters, translate, and print report. If <w> is 'w' write\n"
     "         human-readable copy to pettersenGang.txt\n"
     "  P<w>   read Pettersen gangsters and grid counts, translate. If <w> is 'w' write human-\n"
@@ -3511,6 +3544,7 @@ static const char* commandline()
     "  t<n>   Set to use <n> threads, or <n> = 0 for all virtual processors. Default is 1.\n"
     "  v      If g also given, count in verify mode\n"
     "  w<gangFile> Write gangster file. <gangFile> optional, default is bandGang.txt.\n"
+    "  !      Print GPU properties\n"
     "  ?      Print this\n"
     ;
 }
@@ -3528,9 +3562,9 @@ int main(int argc, char* argv[])
 
   // Scan flags
   bool showNodes = false, showTimers = false, showGangCounts = false;
-  bool dontRun = false, ksp = false;
+  bool dontRun = false, ksp = false, noCount = false;
   bool computeMemberCounts = false, computeBandCounts = false;
-  bool verifyMode = false, countBackwards = false;
+  bool verifyMode = false, countBackwards = false, gpuEnable = false;
   bool countAll = false, writeAll = false;
 
   const char* readFilename = nullptr;
@@ -3579,6 +3613,10 @@ int main(int argc, char* argv[])
           countFilenameBase = defaultCountFileBase;
         break;
 
+      case 'G':
+        gpuEnable = true;
+        break;
+
       case 'k':
         if (sscanf(argv[i], "k%d", &countStartOffset) != 1)
         {
@@ -3589,6 +3627,10 @@ int main(int argc, char* argv[])
 
       case 'm':
         computeMemberCounts = true;
+        break;
+
+      case 'N':
+        noCount = true;
         break;
 
       case 'p':
@@ -3677,6 +3719,14 @@ int main(int argc, char* argv[])
         writeFilename = argv[i] + 1;
         if (*writeFilename == 0)
           writeFilename = defaultFilename;
+        break;
+
+      case '!':
+#ifdef JETSON
+        printDeviceProperties();
+#else
+        printf("No GPU\n");
+#endif
         break;
 
       case '?':
@@ -3804,8 +3854,13 @@ int main(int argc, char* argv[])
     // Count complete grid
     if (countFilenameBase)
     {
-      auto gridCounter = std::make_unique<GridCounter>(*bGang);
-      gridCounter->count(gridSet, numThreads, countFilenameBase, verifyMode, countBackwards, countStartOffset);
+      auto gridCounter = std::make_unique<GridCounter>(*bGang, gpuEnable);
+      gridCounter->count(gridSet, noCount ? -1 : numThreads, countFilenameBase, verifyMode,
+                          countBackwards, countStartOffset);
+
+#ifdef JETSON
+      sudokudaEnd();
+#endif
     }
 
     ProfileTree::stop();

@@ -1,6 +1,7 @@
 This repository holds the source code and data files for my 2022 verification that there are
 exactly 81,171,437,193,104,932,746,936,103,027,318,645,818,654,720,000 legal configurations
-of a 12x12 Sudoku grid with 4x3 boxes.
+of a 12x12 Sudoku grid with 4x3 boxes. It further holds my ongoing research notes and source code on
+programming an Nvidia Jetson AGX Xavier GPU to do the count.
 
 The original exact count was done in 2006 by Kjell Fredrik Pettersen of Norway and Bill Silver
 (this author) of the USA. Pettersen created the enumeration methods and wrote a complete,
@@ -26,12 +27,7 @@ machines. My total running time is about 40% of Pettersen (1035 hours), all impr
 using every parallel thread of 2- and 4-core hyperthreaded 64-bit machines, and about 1.4 GB of
 lookup tables. This does make the present version simpler, which may add to its reliability.
 
-The code compiles and runs with MS Visual Studio C++ under Windows, and Eclipse/GCC under Ubuntu.
-Most of the counts were done on Windows machines, a few on Ubuntu. C++17 is required for
-filesystem access. It uses a commandline interface.
-
-I intend to create a version of this program to run on an Nvidia Jetson AGX Xavier GPU. I will
-push results when I have them.
+The code compiles and runs with MS Visual Studio C++ under Windows (x86 machines), and Eclipse/GCC under Ubuntu (x86 and ARM machines).Most of the counts were done on Windows machines, a few on Ubuntu. C++17 is required for filesystem access. It uses a commandline interface.
 
 (Note: I wrote the Bignum package in about 1995 as my first C++ program and learning exercise,
 with a few modifications over the years. The style looks pretty awkward to me now, but it works,
