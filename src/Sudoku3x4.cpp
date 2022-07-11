@@ -1681,7 +1681,7 @@ bool CountPacket::read(FILE* file)
 
 void CountPacket::write(FILE* file) const
 {
-  fprintf(file, "%6d *%llu %2d %7.3f\n", gangIndex, count, thread, time);
+  fprintf(file, "%6d *%llu %3d %7.3f\n", gangIndex, count, thread, time);
 }
 
 // The central object for finding gangsters, computing gangMembers and bandCounts,
@@ -1856,7 +1856,7 @@ public:
   // the specified vector. Print count progress report. Throw std::runtime_error
   // if a duplicate gangIndex is found with a mismatching count. If all gangsters
   // have been counted, compute and print final result.
-  void countAll(std::vector<Gangster>& gang) const;
+  void countAll(std::vector<Gangster>& gang, const std::string& baseFilename) const;
 
   // Cache performance stats
   std::string printStats() const;
@@ -2509,7 +2509,7 @@ void BandGang::readFile(const std::string & filename, bool verifyMembers, bool v
 // *                                                    *
 // ******************************************************
 
-void BandGang::countAll(std::vector<Gangster>& gang) const
+void BandGang::countAll(std::vector<Gangster>& gang, const std::string& baseFilename) const
 {
   ProfileTree::start("Count all");
 
@@ -2542,7 +2542,7 @@ void BandGang::countAll(std::vector<Gangster>& gang) const
   for (auto const& file : std::filesystem::directory_iterator{ "." })
   {
     std::string filename = file.path().filename().u8string();
-    if (filename.substr(0, 9) == "gridCount")
+    if (file.path().extension() == ".txt" && filename.substr(0, baseFilename.size()) == baseFilename)
     {
       ProfileTree::start("Read count file");
 
@@ -2716,9 +2716,13 @@ public:
   // counted are recounted and verified. Otherwise gangsters already counted are skipped,
   // allowing easy stop/restart of counting.
   //
+  // threads is the number of CPU threads, which can be 0 to mean don't do counting with
+  // CPU threads. If 0 and GPU is not enabled, counting is skipped--just setup is run.
+  //
   // Throws std::runtime_error if any of a varient of errors (i.e. bugs) are detected.
   void count(int gangSet, int threads, const std::string& countFileBase,
-             bool verify, bool countBackwards, int countStartOffset);
+             bool verify, bool countBackwards, int countStartOffset,
+             bool box2GroupMode);
 
 private:
   static constexpr uint32_t DoubleBoxCount = ipower<uint32_t>(ColCompatible::Count, 2);
@@ -2739,16 +2743,64 @@ private:
   bool countBackwards_;
   int countSkip_;
   bool gpuEnable_;
+  uint32_t activeBox01Count_;
 
   // Big tables. See comments in sudokuda.h
   ColCode codeCompatTable_[ColCode::Count][ColCompatible::Count][2];
   GridCountPacket gcPackets[DoubleBoxCount];
 
   void setup_(int gangSetIndex);
-  bool packetOrder_(const GridCountPacket& gcp0, const GridCountPacket& gcp1) const;
+  bool packetOrder_(int gcpIndex0, int gcpIndex1) const;
   void readCountFile_();
   void countIteration_(int gangCode, int threadIndex);
   void printMultiplierHist_() const;
+
+  // *** New box2 group counting data, for good data cache hit rate. ***
+
+  // A box2Group is a sequence of consecutive gangsters in a GangSet that have the
+  // same box2 codes. Being in the same GangSet, they also have the same box0
+  // and box1 codes.
+
+  int box2GroupStartOffset_;  // Offset in current GangSet of first gangster in the group
+  int box2GroupSize_;         // Number of gangsters in the group
+
+  // Return the gangster code of the gangster at the specified index in the group
+  int32_t box2GroupGangCode_(int groupIndex) const
+  {
+    return gang_.gangMembers()[gangSet_->startIndex + box2GroupStartOffset_ + groupIndex];
+  }
+
+  // Return the box2 ColCode of the group
+  ColCode box2GroupCode_() const { return BandGang::box2(box2GroupGangCode_(0)); }
+
+  // A vector of the box3 codes of the group
+  std::vector<ColCode> box2GroupBox3_;
+
+  // A place to accumulate partial counts, effectively box2GroupCounts_[box2GroupSize_][threadCount_]
+  // Each CPU thread needs a set of counts to avoid race conditions
+  std::vector<uint64_t> box2GroupCounts_;
+
+  // Add the specified count to box2GroupCounts_ for the specified groupIndex and threadIndex
+  void box2GroupCountsAdd_(int groupIndex, int threadIndex, uint64_t count)
+  {
+    box2GroupCounts_[groupIndex * threadCount_ + threadIndex] += count;
+  }
+
+  // Get the total count for the specified groupIndex by summing the thread partial counts
+  uint64_t box2GroupCount_(int groupIndex)
+  {
+    uint64_t count = 0;
+    uint64_t* p = box2GroupCounts_.data() + groupIndex * threadCount_;
+    for (int thread = 0; thread < threadCount_; ++thread)
+      count += p[thread];
+    return count;
+  }
+
+  // The iteration function for the Rope threads.
+  void box2GroupIteration_(int box01, int threadIndex);
+
+  // The wrangler handles the Rope
+  void box2GroupWrangler_();
 };
 
 GridCounter::GridCounter(const BandGang& gang, bool gpuEnable)
@@ -2773,9 +2825,9 @@ GridCounter::GridCounter(const BandGang& gang, bool gpuEnable)
 #ifdef JETSON
   if (gpuEnable)
   {
-    ProfileTree::start("Give band counts to GPU");
-    cudaCache((int32_t (*)[ColCode::Count][ColCode::Count])&gang.cache(0),
-              (uint16_t(*)[ColCompatibleCount][2])codeCompatTable_);
+    ProfileTree::start("Band counts, compat table -> GPU");
+    gpuInit((int32_t (*)[ColCode::Count][ColCode::Count])&gang.cache(0),
+            (uint16_t(*)[ColCompatibleCount][2])codeCompatTable_);
     ProfileTree::stop(9 * ColCode::Count * ColCode::Count);
   }
 #endif
@@ -2816,8 +2868,16 @@ void GridCounter::readCountFile_()
          countFile_.c_str(), totalTime_ / 3600.0);
 }
 
-bool GridCounter::packetOrder_(const GridCountPacket& gcp0, const GridCountPacket& gcp1) const
+bool GridCounter::packetOrder_(int gcpIndex0, int gcpIndex1) const
 {
+  const GridCountPacket& gcp0 = gcPackets[gcpIndex0];
+  const GridCountPacket& gcp1 = gcPackets[gcpIndex1];
+
+  if (gcp0.multiplier == 0)
+    return false;
+  if (gcp1.multiplier == 0)
+    return true;
+
   int level00 = gcp0.cacheLevel;
   int level01 = gcPackets[gcp0.otherIndex].cacheLevel;
   sort(level00, level01);
@@ -2825,11 +2885,6 @@ bool GridCounter::packetOrder_(const GridCountPacket& gcp0, const GridCountPacke
   int level10 = gcp1.cacheLevel;
   int level11 = gcPackets[gcp1.otherIndex].cacheLevel;
   sort(level10, level11);
-
-  if (gcp0.multiplier == 0)
-    return false;
-  if (gcp1.multiplier == 0)
-    return true;
 
   if (level00 < level10)
     return true;
@@ -2925,32 +2980,18 @@ void GridCounter::setup_(int gangSetIndex)
   ProfileTree::start("Sort");
 
   // Sort for preferred run order. multiply 0 elements must all be after the others.
-  // This is an expensive sort because the elements are so big, but we don't care. Hope the memory
-  // use is O(1), not O(N)
+  std::vector<int> gcpIndices(DoubleBoxCount);
   for (int i = 0; i < DoubleBoxCount; ++i)
-    gcPackets[i].originalIndex = i;
-  std::sort(gcPackets, gcPackets + DoubleBoxCount,
-            [&](const GridCountPacket& gcp0, const GridCountPacket& gcp1) { return packetOrder_(gcp0, gcp1); });
+    gcpIndices[i] = i;
+  std::sort(gcpIndices.begin(), gcpIndices.end(),
+            [&](int index0, int index1) { return packetOrder_(index0, index1); });
+  for (int i = 0; i < DoubleBoxCount; ++i)
+    gcPackets[i].runOrder = gcpIndices[i];
 
-  // Fix the otherIndex values
-  struct IndexPair
-  {
-    int32_t original, runOrder;
-    IndexPair() = default;
-    IndexPair(int32_t original, int32_t runOrder) : original(original), runOrder(runOrder) {}
-    bool operator<(const IndexPair& ip) const { return original < ip.original; }
-  };
-  std::vector<IndexPair> indexMap(DoubleBoxCount);
-  for (int32_t i = 0; i < DoubleBoxCount; ++i)
-    indexMap[i] = IndexPair(gcPackets[i].originalIndex, i);
-  std::sort(indexMap.begin(), indexMap.end());
-  for (GridCountPacket& gcp : gcPackets)
-  {
-    auto p = std::lower_bound(indexMap.begin(), indexMap.end(), IndexPair(gcp.otherIndex, 0));
-    if (p == indexMap.end() || p->original != gcp.otherIndex)
-      throw std::runtime_error("GridCountPacket sort error");
-    gcp.otherIndex = p->runOrder;
-  }
+  // Get number of box01 indices are active (multiplier > 0)
+  for (activeBox01Count_ = 0;
+       gcPackets[gcPackets[activeBox01Count_].runOrder].multiplier > 0;
+       ++activeBox01Count_);
 
   ProfileTree::stop();
 
@@ -2958,7 +2999,7 @@ void GridCounter::setup_(int gangSetIndex)
   if (gpuEnable_)
   {
     ProfileTree::start("Tables -> GPU");
-    cudaSetup(gcPackets);
+    gpuSetup(gcPackets);
     ProfileTree::stop();
   }
 #endif
@@ -2993,18 +3034,10 @@ void GridCounter::countIteration_(int gangOffset, int threadIndex)
 
   uint64_t count = 0;
 
-#ifdef JETSON
-  if (gpuEnable_ && threadIndex == 0)
-    count = cudaCount(box2(), box3());
-  else
-#endif
-
-  for (uint32_t box01 = 0; box01 < DoubleBoxCount; ++box01)
+  for (uint32_t runIndex = 0; runIndex < activeBox01Count_; ++runIndex)
   {
+    uint32_t box01 = gcPackets[runIndex].runOrder;
     const GridCountPacket& gcp0 = gcPackets[box01];
-
-    if (gcp0.multiplier == 0)
-      break;
 
     int box01Other = gcp0.otherIndex;
     const GridCountPacket& gcp1 = gcPackets[box01Other];
@@ -3083,7 +3116,8 @@ void GridCounter::countIteration_(int gangOffset, int threadIndex)
 }
 
 void GridCounter::count(int gangSet, int threads, const std::string& countFileBase,
-                        bool verify, bool countBackwards, int countStartOffset)
+                        bool verify, bool countBackwards, int countStartOffset,
+                        bool box2GroupMode)
 {
   ProfileTree::start("Grid counter");
 
@@ -3093,7 +3127,7 @@ void GridCounter::count(int gangSet, int threads, const std::string& countFileBa
   countFile_ += ".txt";
 
   verifyMode_ = verify;
-  threadCount_ = threads;
+  threadCount_ = threads + (int)gpuEnable_;
   countBackwards_ = countBackwards;
 
   const GangSet& gset = gang_.gangSet(gangSet);
@@ -3104,11 +3138,18 @@ void GridCounter::count(int gangSet, int threads, const std::string& countFileBa
   setup_(gangSet);
   //printMultiplierHist_();
 
-  if (threads >= 0)
+  if (threadCount_ > 0)
   {
     ProfileTree::start("Main count loop");
-    Rope<GridCounter> rope(this, &GridCounter::countIteration_);
-    rope.run(gset.count, threads);
+    if (!box2GroupMode)
+    {
+      Rope<GridCounter> rope(this, &GridCounter::countIteration_);
+      rope.run(gset.count, threads);
+    }
+    else
+    {
+      box2GroupWrangler_();
+    }
     ProfileTree::stop(gset.count - countSkip_);
     fprintf(stderr, "\n");
   }
@@ -3124,43 +3165,193 @@ void GridCounter::printMultiplierHist_() const
   h.print("Grid count multipliers");
 }
 
-static void test()
+// **************************
+// *                        *
+// *  Box 2 Group Counting  *
+// *                        *
+// **************************
+
+void GridCounter::box2GroupIteration_(int runIndex, int threadIndex)
 {
-  struct CodePair
+  int32_t box01 = gcPackets[runIndex].runOrder;
+
+  ColCode box2 = box2GroupCode_();
+
+#ifdef JETSON
+  if (gpuEnable_ && threadIndex == 0)
   {
-    ColCode b1, b2;
-    CodePair() = default;
-    CodePair(ColCode b1, ColCode b2) : b1(b1), b2(b2) {}
+    gpuMainCount(box01, box2());
+  }
+  else
+#endif
 
-    bool operator==(const CodePair& cp) const { return cp.b1 == b1 && cp.b2 == b2; }
-    bool operator<(const CodePair& cp) const { return b1 < cp.b1 || (b1 == cp.b1 && b2 < cp.b2); }
-  };
-
-  NumList<CodePair, uint16_t> table[ColCode::Count];
-
-  std::vector<ColSets> list;
-  for (ColCode c(0); c.isValid(); ++c)
   {
-    ColCompatible::makeSets(c, list);
-    for (int i = 0; i < ColCompatible::Count; ++i)
+    const GridCountPacket& gcp0 = gcPackets[box01];
+
+    int box01Other = gcp0.otherIndex;
+    const GridCountPacket& gcp1 = gcPackets[box01Other];
+
+    std::vector<uint16_t[ColCompatible::Count]> box7 (box2GroupSize_);
+    std::vector<uint16_t[ColCompatible::Count]> box11(box2GroupSize_);
+    for (int groupIndex = 0; groupIndex < box2GroupSize_; ++groupIndex)
     {
-      ColCode b1 = list[i].makeCanonical();
-      ColCode b2 = (ColSets(c) | list[i]).invert().makeCanonical();
-      table[c()].enter(CodePair(b1, b2));
+      ColCode box3 = box2GroupBox3_[groupIndex];
+      for (int b3 = 0; b3 < ColCompatible::Count; ++b3)
+      {
+        int b7 = codeCompatTable_[box3()][b3][0]();
+        int b11 = codeCompatTable_[box3()][b3][1]();
+
+        box7 [groupIndex][b3] = gcp0.doubleRename[b7];
+        box11[groupIndex][b3] = gcp1.doubleRename[b11];
+      }
+    }
+
+    for (int b2 = 0; b2 < ColCompatible::Count; ++b2)
+    {
+      int box6  = codeCompatTable_[box2()][b2][0]();
+      int box10 = codeCompatTable_[box2()][b2][1]();
+
+      box6  = gcp0.doubleRename[box6 ];
+      box10 = gcp1.doubleRename[box10];
+
+      const int32_t* band1CacheLine = gang_.cache(gcp0.cacheLevel).address(box6 , 0);
+      const int32_t* band2CacheLine = gang_.cache(gcp1.cacheLevel).address(box10, 0);
+
+      for (int groupIndex = 0; groupIndex < box2GroupSize_; ++groupIndex)
+      {
+        uint64_t count = 0;
+        for (int b3 = 0; b3 < ColCompatible::Count; ++b3)
+          count += (uint64_t)band1CacheLine[box7[groupIndex][b3]] * band2CacheLine[box11[groupIndex][b3]];
+        box2GroupCountsAdd_(groupIndex, threadIndex, count * gcPackets[box01].multiplier);
+      }
     }
   }
 
-  IList h;
-  for (int i = 0; i < ColCode::Count; ++i)
-    h.enter((int)table[i].size());
-  h.print("Code count histogram");
+  if (runIndex % 100 == 0)
+    fprintf(stderr, "\r%5d-%5d/%5d: %5d/%d",
+            box2GroupStartOffset_, box2GroupStartOffset_ + box2GroupSize_ - 1, gangSet_->count,
+            runIndex, activeBox01Count_);
+}
 
-  h.clear();
-  for (int i = 0; i < ColCode::Count; ++i)
-    for (const auto& e : table[i])
-      if (e.count > 1)
-        h.enter(e.code.b1());
-  h.print("Code identity histogram");
+void GridCounter::box2GroupWrangler_()
+{
+  int direction;
+  if (!countBackwards_)
+  {
+    box2GroupStartOffset_ = countSkip_;
+    direction = 1;
+  }
+  else
+  {
+    box2GroupStartOffset_ = gangSet_->count - countSkip_ - 1;
+    direction = -1;
+  }
+
+  Timer setTimer(true);
+  int gangstersEnumerated = 0;
+
+  while (0 <= box2GroupStartOffset_ && box2GroupStartOffset_ < gangSet_->count)
+  {
+    if (!verifyMode_ && counts_[box2GroupStartOffset_] > 0)
+    {
+      box2GroupStartOffset_ += direction;
+      continue;
+    }
+
+    Timer groupTimer(true);
+
+    // find group size
+    box2GroupSize_ = 0;
+    for (int gangOffset = box2GroupStartOffset_;
+         0 <= gangOffset && gangOffset < gangSet_->count;
+         gangOffset += direction)
+    {
+      int groupOffset = gangOffset - box2GroupStartOffset_;
+      if (BandGang::box2(box2GroupGangCode_(groupOffset)) != box2GroupCode_())
+        break;
+      if (verifyMode_ || counts_[gangOffset] == 0)
+        box2GroupSize_ = direction * groupOffset + 1;
+    }
+
+    if (countBackwards_)
+      box2GroupStartOffset_ -= box2GroupSize_ - 1;
+
+    // Initialize partial counts
+    box2GroupCounts_.resize(box2GroupSize_ * threadCount_);
+    for (uint64_t& count : box2GroupCounts_)
+      count = 0;
+
+    // Fetch box3 codes
+    box2GroupBox3_.resize(box2GroupSize_);
+    for (int groupIndex = 0; groupIndex < box2GroupSize_; ++groupIndex)
+      box2GroupBox3_[groupIndex] = BandGang::box3(box2GroupGangCode_(groupIndex));
+
+    // Set gpu box2 group
+#ifdef JETSON
+    if (gpuEnable_)
+      gpuGroup(box2GroupSize_, (const uint16_t*)box2GroupBox3_.data());
+#endif
+
+    // Run all active box01 indices on all threads
+    Rope<GridCounter> rope(this, &GridCounter::box2GroupIteration_);
+    rope.run(activeBox01Count_, threadCount_);
+
+    // Add box2 group
+#ifdef JETSON
+    if (gpuEnable_)
+      gpuAddGroup(box2GroupCounts_.data(), threadCount_);
+#endif
+
+    double secondsPerGangsterGroup = groupTimer.elapsedSeconds() / box2GroupSize_;
+
+    gangstersEnumerated += box2GroupSize_;
+    double secondsPerGangsterSet = setTimer.elapsedSeconds() / gangstersEnumerated;
+
+    // show status
+    fprintf(stderr, "  %5.2f/%5.2f s/g", secondsPerGangsterGroup, secondsPerGangsterSet);
+
+    std::FILE* file = nullptr;
+    for (int groupIndex = 0; groupIndex < box2GroupSize_; ++groupIndex)
+    {
+      int gangOffset = box2GroupStartOffset_ + groupIndex;
+      int gangIndex = gangSet_->startIndex + gangOffset;
+      uint64_t count = box2GroupCount_(groupIndex);
+
+      if (counts_[gangOffset] == 0)
+      {
+        counts_[gangOffset] = count;
+
+        if (!file)
+          file = fopen(countFile_.c_str(), "a");
+        if (file)
+        {
+          CountPacket cp;
+          cp.gangIndex = gangIndex;
+          cp.count = count;
+          cp.thread = groupIndex;
+          cp.time = secondsPerGangsterGroup;
+          cp.write(file);
+        }
+        else
+          throw std::runtime_error("Can't write count file");
+      }
+      else if (counts_[gangOffset] != count)
+      {
+        printf("\n%d.%d (%d) expected %s got %s\n",
+               gangSetIndex_, gangOffset, gangIndex,
+               commas(counts_[gangOffset]).c_str(), commas(count).c_str());
+        throw std::runtime_error("Count verification failure");
+      }
+    }
+    if (file)
+      fclose(file);
+
+    // Update box2GroupStartIndex_
+    if (countBackwards_)
+      --box2GroupStartOffset_;
+    else
+      box2GroupStartOffset_ += box2GroupSize_;
+  }
 }
 
 // ***************************************************
@@ -3518,16 +3709,18 @@ static const char* commandline()
     "         If combined with P, Pettersen and Silver gangsters are compared and reported.\n"
     "         If <w> is 'w' write human-readable copy to sGang.txt\n"
     "  e      compute and print the KSP estimate\n"
-    "  g<set><dir><basefile> begin grid counting\n"
-    "         <set>      GridSet 0 - 8\n"
+    "  f<baseFile> Set base filename for count files used by c and g. Count files will be\n"
+    "              <basefile>_g<set><dir>.txt. If f is not given, <baseFile> is 'gridCount'\n"
+    "  g<set><dir> begin grid counting\n"
+    "         <set>      GridSet 0 - 8, or ! for all sets\n"
     "         <dir>      optional '-' for count backwards\n"
-    "         <basefile> Optional, default is \"gridCount\". Count file will be\n"
-    "                    <basefile>_g<set><dir>.txt\n"
-    "  G      enable GPU"
+    "  G<blocks>,<threads> enable GPU, force box2 group counting\n"
+    "         Can specify <blocks>,<threads>, just <blocks>, or neither, default is emperical best\n"
     "  k<setOffset> If g is given, begin grid counting at <setOffset> within the GridSet,\n"
     "         and work forward or backward from there\n"
     "  m      compute gangMembers (can also be read from file with r and verified)\n"
-    "  N      Skip the grid counting\n"
+    "  N      Don't use CPU threads for grid counting. If GPU counting is also not selected, counting\n"
+    "         is skipped and only the setup functions are run for testing and timing\n"
     "  p<w>   read Pettersen gangsters, translate, and print report. If <w> is 'w' write\n"
     "         human-readable copy to pettersenGang.txt\n"
     "  P<w>   read Pettersen gangsters and grid counts, translate. If <w> is 'w' write human-\n"
@@ -3543,6 +3736,8 @@ static const char* commandline()
     "         * show everything\n"
     "  t<n>   Set to use <n> threads, or <n> = 0 for all virtual processors. Default is 1.\n"
     "  v      If g also given, count in verify mode\n"
+    "  2<use> <use> omoitted or + to use box2 group counting mode , <use> - or switch omitted\n"
+    "         to use original counting mode\n"
     "  w<gangFile> Write gangster file. <gangFile> optional, default is bandGang.txt.\n"
     "  !      Print GPU properties\n"
     "  ?      Print this\n"
@@ -3557,21 +3752,21 @@ static const char* commandline()
 
 int main(int argc, char* argv[])
 {
-  constexpr const char* defaultFilename = "bandGang.txt";
-  constexpr const char* defaultCountFileBase = "gridCount";
+  constexpr const char* defaultGangFilename = "bandGang.txt";
 
   // Scan flags
   bool showNodes = false, showTimers = false, showGangCounts = false;
   bool dontRun = false, ksp = false, noCount = false;
   bool computeMemberCounts = false, computeBandCounts = false;
   bool verifyMode = false, countBackwards = false, gpuEnable = false;
-  bool countAll = false, writeAll = false;
+  bool countAll = false, writeAll = false, box2GroupMode = false;
 
   const char* readFilename = nullptr;
   const char* writeFilename = nullptr;
-  const char* countFilenameBase = nullptr;
+  const char* countFilenameBase = "gridCount";
 
-  int numThreads = 1, gridSet = 0, countStartOffset = 0;
+  int numThreads = 1, gridSet = -1, countStartOffset = 0;
+  int gpuThreads = 32, gpuBlocks = 88;
 
   std::vector<Gangster> pGang;
 
@@ -3595,26 +3790,50 @@ int main(int argc, char* argv[])
         ksp = true;
         break;
 
-      case 'g':
-        gridSet = argv[i][1] - '0';
-        if (gridSet < 0 || gridSet > 8)
+      case 'f':
+        countFilenameBase = argv[i] + 1;
+        if (!*countFilenameBase)
         {
-          fprintf(stderr, "Bad grid set");
+          fprintf(stderr, "Bad base filename");
           dontRun = true;
-          break;
+        }
+        break;
+
+      case 'g':
+        if (argv[i][1] == '!')
+          gridSet = 9;
+        else
+        {
+          gridSet = argv[i][1] - '0';
+          if (gridSet < 0 || gridSet > 8)
+          {
+            fprintf(stderr, "Bad grid set\n");
+            dontRun = true;
+            break;
+          }
         }
 
-        countFilenameBase = argv[i] + 2;
-        countBackwards = *countFilenameBase == '-';
-        if (countBackwards)
-          ++countFilenameBase;
-
-        if (*countFilenameBase == 0)
-          countFilenameBase = defaultCountFileBase;
+        countBackwards = argv[i][2] == '-';
         break;
 
       case 'G':
+#ifdef JETSON
         gpuEnable = true;
+        box2GroupMode = true;
+        sscanf(argv[i] + 1, "%d,%d", &gpuBlocks, &gpuThreads);
+        if (1 <= gpuBlocks && gpuBlocks <= 256 && 1 <= gpuThreads && gpuThreads <= 1024)
+        {
+          gpuGrid(gpuBlocks, gpuThreads);
+          printf("GPU using %d blocks, %d threads\n", gpuBlocks, gpuThreads);
+        }
+        else
+        {
+          fprintf(stderr, "Bad GPU block,thread count\n");
+          dontRun = true;
+        }
+#else
+        printf("No GPU\n");
+#endif
         break;
 
       case 'k':
@@ -3665,7 +3884,7 @@ int main(int argc, char* argv[])
         // read filename
         readFilename = argv[i] + 1;
         if (*readFilename == 0)
-          readFilename = defaultFilename;
+          readFilename = defaultGangFilename;
         break;
 
       case 's':
@@ -3718,7 +3937,23 @@ int main(int argc, char* argv[])
         // write filename
         writeFilename = argv[i] + 1;
         if (*writeFilename == 0)
-          writeFilename = defaultFilename;
+          writeFilename = defaultGangFilename;
+        break;
+
+      case '2':
+        switch (argv[i][1])
+        {
+        case '+':
+        case 0:
+          box2GroupMode = true;
+          break;
+        case '-':
+          box2GroupMode = false;
+          break;
+        default:
+          fprintf(stderr, "%c unknown box2 group mode\n", argv[i][1]);
+          dontRun = true;
+        }
         break;
 
       case '!':
@@ -3743,7 +3978,13 @@ int main(int argc, char* argv[])
     if (dontRun)
       return 1;
 
-    printf("Using %d thread%s\n", numThreads, numThreads == 1 ? "" : "s");
+    if (gpuEnable && !box2GroupMode)
+    {
+      printf("Can't reject box2 group counting mode with GPU\n");
+      return 1;
+    }
+
+    printf("CPU using %d thread%s\n", numThreads, numThreads == 1 ? "" : "s");
 
     if (showTimers)
       ProfileTree::clear();
@@ -3801,7 +4042,7 @@ int main(int argc, char* argv[])
     if (countAll)
     {
       std::vector<Gangster> gang;
-      bGang->countAll(gang);
+      bGang->countAll(gang, countFilenameBase);
       if (writeAll)
       {
         Gangster::writeAll(gang, "sGang.txt");
@@ -3852,11 +4093,23 @@ int main(int argc, char* argv[])
       bGang->writeFile(writeFilename);
 
     // Count complete grid
-    if (countFilenameBase)
+    if (gridSet >= 0)
     {
       auto gridCounter = std::make_unique<GridCounter>(*bGang, gpuEnable);
-      gridCounter->count(gridSet, noCount ? -1 : numThreads, countFilenameBase, verifyMode,
-                          countBackwards, countStartOffset);
+      if (gridSet <= 8)
+        gridCounter->count(gridSet, noCount ? 0 : numThreads, countFilenameBase, verifyMode,
+                           countBackwards, countStartOffset, box2GroupMode);
+      else
+      {
+        for (int set = 0; set < 9; ++set)
+          gridCounter->count(set, noCount ? 0 : numThreads, countFilenameBase, verifyMode,
+                             countBackwards, countStartOffset, box2GroupMode);
+
+        std::vector<Gangster> gang;
+        bGang->countAll(gang, countFilenameBase);
+        if (writeAll)
+          Gangster::writeAll(gang, "sGang.txt");
+      }
 
 #ifdef JETSON
       sudokudaEnd();

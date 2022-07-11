@@ -3,15 +3,6 @@
 // *  Sudoku 3x4 Cuda Code  *
 // *                        *
 // **************************
-//
-// The following is a first cut at a Cuda GPU program for executing the main grid counting
-// loop for the Sudoku 3x4 exact count. It makes very poor use of GPU resources, and is
-// actually slower than running the CPU code on the Jetson's 8-core ARM v8.2 processors.
-// The purpose of this first cut is to confirm that I understand the Nvidia tool chain
-// and the most basic operations of Cuda. The code runs and gets the correct results.
-// The first step in using the GPU properly will be to deal with the poor memory access
-// pattern, which radically degrades the GPU's memory bandwidth and stalls the compute
-// elements. I have a plan ...
 
 // This file is edited in Visual Studio by fooling it into thinking it's a cpp file,
 // then copied to the Jetson and renamed from cpp to cu. These definitions aid that
@@ -19,23 +10,67 @@
 #ifndef JETSON
 #define JETSON
 #define __global__
+struct { int x, y, z;} threadIdx, blockIdx, blockDim, gridDim;
 #endif
 
 #include <stdint.h>
 #include <cudapp.h>
+#include <vector>
+#include <array>
 #include "sudokuda.h"
 
 constexpr uint32_t DoubleBoxCount = ColCompatibleCount * ColCompatibleCount;
 
+int threads = 32;
+int blocks = 88;
+
+// ****************
+// *              *
+// *  Big Tables  *
+// *              *
+// ****************
+//
+// Huge tables created by CPU code and copied to device memory here. Also some device
+// and host arrays allocated here to avoid alloc/free operations in the counting loops.
+// All device and host memory collected here so it can be constructed and destroyed
+// easily.
 struct BigTables
 {
-  CudaUnifiedMemory<int32_t [ColCodeCount][ColCodeCount]> gangCache = 9;
+  // Device copy of BangGang::gangCache_, holding band counts at this stage
+  CudaDeviceMemory<int32_t [ColCodeCount][ColCodeCount]> gangCache{ 9 };
 
-  CudaUnifiedMemory<uint16_t [ColCompatibleCount][2]> codeCompatTable = ColCodeCount;
+  // Device copy of GridCounter::codeCompatTable_
+  const uint16_t (*codeCompatTableHost)[ColCompatibleCount][2];
+  CudaDeviceMemory<uint16_t [ColCompatibleCount][2]> codeCompatTableDev{ ColCodeCount };
 
-  CudaUnifiedMemory<GridCountPacket> gcPackets = DoubleBoxCount;
+  // Device copy of GridCounter::gcPackets_
+  const GridCountPacket* gcPacketsHost;
+  CudaDeviceMemory<GridCountPacket> gcPacketsDev{ DoubleBoxCount };
+
+  // list of box3 codes for current group
+  CudaDeviceMemory<uint16_t> box3;
+
+  // Device box7 and box11 codes
+  CudaDeviceMemory<std::array<uint16_t, ColCompatibleCount>> box7;
+  CudaDeviceMemory<std::array<uint16_t, ColCompatibleCount>> box11;
+
+  // Partial counts, effectively uint64_t counts[blocks][box2GroupSize]
+  CudaDeviceMemory<uint64_t> counts;
+
+  int groupSize() const { return box3.numElements(); }
 }
 *bigTables = nullptr;
+
+void sudokudaEnd()
+{
+  delete bigTables;
+}
+
+// **************************
+// *                        *
+// *  Print GPU Properties  *
+// *                        *
+// **************************
 
 void printDeviceProperties()
 {
@@ -58,95 +93,177 @@ void printDeviceProperties()
   printf("Warp size in threads %d \n", dp.warpSize);
 }
 
-void sudokudaEnd()
+// ************************************
+// *                                  *
+// *  Setup Functions Called by Host  *
+// *                                  *
+// ************************************
+
+void gpuGrid(int blocks, int threads)
 {
-  delete bigTables;
+  ::blocks = blocks;
+  ::threads = threads;
 }
 
-
-void cudaCache(const int32_t cache[][ColCodeCount][ColCodeCount],
-               const uint16_t codeCompatTable[][ColCompatibleCount][2])
+void gpuInit(const int32_t cache[][ColCodeCount][ColCodeCount],
+             const uint16_t codeCompatTable[][ColCompatibleCount][2])
 {
   if (!bigTables)
     bigTables = new BigTables();
   bigTables->gangCache.copyTo(cache);
-  bigTables->codeCompatTable.copyTo(codeCompatTable);
+  bigTables->codeCompatTableHost = codeCompatTable;
+  bigTables->codeCompatTableDev.copyTo(codeCompatTable);
 }
 
-void cudaSetup(const GridCountPacket* gcPackets)
+void gpuSetup(const GridCountPacket* gcPackets)
 {
-  bigTables->gcPackets.copyTo(gcPackets);
+  bigTables->gcPacketsHost = gcPackets;
+  bigTables->gcPacketsDev.copyTo(gcPackets);
 }
 
 __global__
-void count(const int32_t  gangCache[][ColCodeCount][ColCodeCount], 
-           const uint16_t codeCompatTable[][ColCompatibleCount][2],
-           const GridCountPacket* gcPackets,
-           int box2, int box3, uint64_t* counts)
+void clearCounts(uint64_t* counts, int groupSize)
 {
-  uint32_t threadIndex = threadIdx.x + blockIdx.x * blockDim.x;
-  uint32_t stride = blockDim.x * gridDim.x;
-
-  uint16_t box7[ColCompatibleCount], box11[ColCompatibleCount];
-
-  uint64_t count = 0;
-
-  for (uint32_t box01 = threadIndex; box01 < DoubleBoxCount; box01 += stride)
-  {
-    const GridCountPacket& gcp0 = gcPackets[box01];
-
-    if (gcp0.multiplier == 0)
-      continue;
-
-    int box01Other = gcp0.otherIndex;
-    const GridCountPacket& gcp1 = gcPackets[box01Other];
-
-    const int32_t (*band1Cache)[ColCodeCount] = gangCache[gcp0.cacheLevel];
-    const int32_t (*band2Cache)[ColCodeCount] = gangCache[gcp1.cacheLevel];
-
-    for (int b3 = 0; b3 < ColCompatibleCount; ++b3)
-    {
-      int b7  = codeCompatTable[box3][b3][0];
-      int b11 = codeCompatTable[box3][b3][1];
-
-      box7 [b3] = gcp0.doubleRename[b7 ];
-      box11[b3] = gcp1.doubleRename[b11];
-    }
-
-    uint64_t partialCount = 0;
-    for (int b2 = 0; b2 < ColCompatibleCount; ++b2)
-    {
-      int box6  = codeCompatTable[box2][b2][0];
-      int box10 = codeCompatTable[box2][b2][1];
-
-      box6  = gcp0.doubleRename[box6 ];
-      box10 = gcp1.doubleRename[box10];
-
-      for (int b3 = 0; b3 < ColCompatibleCount; ++b3)
-        partialCount += (uint64_t)band1Cache[box6][box7[b3]] * band2Cache[box10][box11[b3]];
-    }
-
-    count += partialCount * gcp0.multiplier;
-  }
-
-  counts[threadIndex] = count;
+  uint64_t* p = counts + blockIdx.x * groupSize;
+  for (int groupIndex = threadIdx.x; groupIndex < groupSize; groupIndex += blockDim.x)
+    p[groupIndex] = 0;
 }
 
-uint64_t cudaCount(uint16_t box2, uint16_t box3)
+void gpuGroup(int box2GroupSize, const uint16_t* box3List)
 {
-  int blocks = 16;
-  int threads = 32;
+  bigTables->box3.alloc(box2GroupSize);
+  bigTables->box3.copyTo(box3List);
 
-  CudaUnifiedMemory<uint64_t> counts = blocks * threads;
+  bigTables->box7 .alloc(box2GroupSize);
+  bigTables->box11.alloc(box2GroupSize);
 
-  count<<<blocks, threads>>>(bigTables->gangCache.mem(), bigTables->codeCompatTable.mem(),
-                             bigTables->gcPackets.mem(), box2, box3, counts.mem());
+  bigTables->counts.alloc(box2GroupSize * blocks);
+  clearCounts<<<blocks, threads>>>(bigTables->counts.mem(), box2GroupSize);
+}
+
+void gpuAddGroup(uint64_t* groupCounts, int groupStride)
+{
+  std::vector<uint64_t> counts(bigTables->counts.numElements());
+  bigTables->counts.copyFrom(counts.data());
+
+  int groupSize = bigTables->groupSize();
+
+  for (int groupIndex = 0; groupIndex < groupSize; ++groupIndex)
+  {
+    uint64_t count = 0;
+    for (int block = 0; block < blocks; ++block)
+      count += counts[block * groupSize + groupIndex];
+    groupCounts[groupIndex * groupStride] += count;
+  }
+}
+
+// ***********************
+// *                     *
+// *  Box7/Box11 Kernel  *
+// *                     *
+// ***********************
+
+__global__
+void box711(int groupSize, const uint16_t (*codeCompatTable)[ColCompatibleCount][2],
+            const uint16_t* doubleRename0, const uint16_t* doubleRename1,
+            const uint16_t* box3List, uint16_t* box7, uint16_t* box11)
+{
+  for (int groupIndex = blockIdx.x; groupIndex < groupSize; groupIndex += gridDim.x)
+  {
+    int box3 = box3List[groupIndex];
+    const uint16_t (*compat)[2] = codeCompatTable[box3];
+
+    uint16_t* box7Line  = box7  + groupIndex * ColCompatibleCount;
+    uint16_t* box11Line = box11 + groupIndex * ColCompatibleCount;
+
+    for (int b3 = threadIdx.x; b3 < ColCompatibleCount; b3 += blockDim.x)
+    {
+      int b7  = compat[b3][0];
+      int b11 = compat[b3][1];
+
+      box7Line [b3] = doubleRename0[b7 ];
+      box11Line[b3] = doubleRename1[b11];
+    }
+  }
+}
+
+// **************************
+// *                        *
+// *  Main Counting Kernel  *
+// *                        *
+// **************************
+
+__global__
+void groupCount(const uint16_t (*codeCompatTable)[2],
+                const uint16_t* doubleRename0, const uint16_t* doubleRename1,
+                const int32_t (*cache0)[ColCodeCount], const int32_t (*cache1)[ColCodeCount],
+                const uint16_t* box7, const uint16_t* box11,
+                int groupSize, int multiplier, uint64_t* counts)
+{
+  uint64_t* p = counts + blockIdx.x * groupSize;
+
+  for (int b2 = blockIdx.x; b2 < ColCompatibleCount; b2 += gridDim.x)
+  {
+    int box6  = codeCompatTable[b2][0];
+    int box10 = codeCompatTable[b2][1];
+
+    box6  = doubleRename0[box6 ];
+    box10 = doubleRename1[box10];
+
+    const int32_t* band1CacheLine = cache0[box6 ];
+    const int32_t* band2CacheLine = cache1[box10];
+
+    for (int groupIndex = threadIdx.x; groupIndex < groupSize; groupIndex += blockDim.x)
+    {
+      const uint16_t* box7Line  = box7  + groupIndex * ColCompatibleCount;
+      const uint16_t* box11Line = box11 + groupIndex * ColCompatibleCount;
+      uint64_t count = 0;
+      for (int b3 = 0; b3 < ColCompatibleCount; ++b3)
+        count += (uint64_t)band1CacheLine[box7Line[b3]] * band2CacheLine[box11Line[b3]];
+      p[groupIndex] += count * multiplier;
+    }
+  }
+}
+
+// *****************************
+// *                           *
+// *  Main Counting Host Code  *
+// *                           *
+// *****************************
+
+void gpuMainCount(int box01, int box2)
+{
+  const GridCountPacket& gcp0 = bigTables->gcPacketsHost[box01];
+
+  int box01Other = gcp0.otherIndex;
+  const GridCountPacket& gcp1 = bigTables->gcPacketsHost[box01Other];
+
+  int groupSize = bigTables->groupSize();
+
+  uint16_t* box7  = bigTables->box7 [0].data();
+  uint16_t* box11 = bigTables->box11[0].data();
+
+  const uint16_t* doubleRename0 = bigTables->gcPacketsDev[box01     ].doubleRename;
+  const uint16_t* doubleRename1 = bigTables->gcPacketsDev[box01Other].doubleRename;
+
+  box711<<<blocks, threads>>>(groupSize, bigTables->codeCompatTableDev.mem(),
+                              doubleRename0, doubleRename1, bigTables->box3.mem(),
+                              box7, box11);
   checkLaunch();
-  safeSync();
 
-  uint64_t total = 0;
-  for (size_t i = 0; i < counts.numElements(); ++i)
-    total += counts[i];
+  const uint16_t (*codeCompatTable)[2] = bigTables->codeCompatTableDev[box2];
 
-  return total;
+  const int32_t (*cache0)[ColCodeCount] = bigTables->gangCache[gcp0.cacheLevel];
+  const int32_t (*cache1)[ColCodeCount] = bigTables->gangCache[gcp1.cacheLevel];
+
+  int multiplier = bigTables->gcPacketsHost[box01].multiplier;
+
+  uint64_t* counts = bigTables->counts.mem();
+  //safeSync();
+
+  groupCount<<<blocks, threads>>>(codeCompatTable, doubleRename0, doubleRename1,
+                                  cache0, cache1, box7, box11,
+                                  groupSize, multiplier, counts);
+  checkLaunch();
+  //safeSync();
 }

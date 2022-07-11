@@ -107,6 +107,11 @@ public:
     cudaMemcpy(this->mem_, src, this->numBytes(), cudaMemcpyHostToDevice);
   }
 
+  void copyFrom(void* dst)
+  {
+    cudaMemcpy(dst, this->mem_, this->numBytes(), cudaMemcpyDeviceToHost);
+  }
+
   void prefetchAsync()
   {
     int deviceId = cudaGetDevice(&deviceId);

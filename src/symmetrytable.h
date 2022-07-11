@@ -41,6 +41,9 @@ public:
         table_[i][j] = value;
   }
 
+  T* address(uint32_t x, uint32_t y) { return &table_[x][y]; }
+  const T* address(uint32_t x, uint32_t y) const { return &table_[x][y]; }
+
 private:
   T table_[Dim][Dim];
 };
@@ -50,12 +53,12 @@ template<typename T, uint32_t Dim>
 class SymTable<T, Dim, true>
 {
 public:
-  const T& get(uint32_t x, uint32_t y) const { return table_[address_(x, y)]; }
+  const T& get(uint32_t x, uint32_t y) const { return *address(x, y); }
 
   // Set new value and return previous value
   T set(uint32_t x, uint32_t y, const T& value)
   {
-    T& vRef = table_[address_(x, y)];
+    T& vRef = *address(x, y);
     T v = vRef;
     vRef = value;
     return v;
@@ -67,16 +70,16 @@ public:
       table_[i] = value;
   }
 
-private:
-  static constexpr size_t size_ = (size_t)Dim * (Dim + 1) / 2;
-  T table_[size_];
-
-  static size_t address_(uint32_t x, uint32_t y)
+  T* address(uint32_t x, uint32_t y)
   {
     uint32_t u = std::min(x, y);
     uint32_t v = std::max(x, y);
-    return (((uint64_t)v * (v + 1)) >> 1) + u;
+    return table_ + (((uint64_t)v * (v + 1)) >> 1) + u;
   }
+
+private:
+  static constexpr size_t size_ = (size_t)Dim * (Dim + 1) / 2;
+  T table_[size_];
 };
 
 #endif
