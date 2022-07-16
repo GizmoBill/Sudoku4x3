@@ -10,7 +10,16 @@
 #ifndef JETSON
 #define JETSON
 #define __global__
-struct { int x, y, z;} threadIdx, blockIdx, blockDim, gridDim;
+
+struct dim3
+{
+  uint32_t x, y, z;
+  dim3(uint32_t x = 1, uint32_t y = 1, uint32_t z = 1)
+    : x(x), y(y), z(z)
+  {}
+}
+threadIdx, blockIdx, blockDim, gridDim;
+
 #endif
 
 #include <stdint.h>
@@ -21,8 +30,25 @@ struct { int x, y, z;} threadIdx, blockIdx, blockDim, gridDim;
 
 constexpr uint32_t DoubleBoxCount = ColCompatibleCount * ColCompatibleCount;
 
-int threads = 32;
-int blocks = 88;
+dim3 threads(32);
+dim3 blocks(88);
+
+struct Box711
+{
+  uint16_t box7;
+  uint16_t box11;
+  Box711() = default;
+  Box711(uint16_t box7, uint16_t box11) : box7(box7), box11(box11) {}
+};
+
+// Box711 box711[ceil(groupSize/Coalesce)][ColCompatibleCount][Coalesce];
+// get(groupIndex, b3) = box711[groupIndex >> CoalesceBits][b3/Coalesce][groupIndex & CoalesceMaskLo]
+// thread(groupIndex, b3) = groupIndex & 31;
+// assume blockDim.x is power of 2
+constexpr uint32_t CoalesceBits = 2;
+constexpr uint32_t Coalesce = 1 << CoalesceBits;
+constexpr uint32_t CoalesceMaskLo = Coalesce - 1;
+constexpr uint32_t CoalesceMaskHi = ~CoalesceMaskLo;
 
 // ****************
 // *              *
@@ -51,8 +77,7 @@ struct BigTables
   CudaDeviceMemory<uint16_t> box3;
 
   // Device box7 and box11 codes
-  CudaDeviceMemory<std::array<uint16_t, ColCompatibleCount>> box7;
-  CudaDeviceMemory<std::array<uint16_t, ColCompatibleCount>> box11;
+  CudaDeviceMemory<Box711> box711;
 
   // Partial counts, effectively uint64_t counts[blocks][box2GroupSize]
   CudaDeviceMemory<uint64_t> counts;
@@ -99,10 +124,11 @@ void printDeviceProperties()
 // *                                  *
 // ************************************
 
-void gpuGrid(int blocks, int threads)
+void gpuGrid(uint32_t blocksX, uint32_t threadsX, uint32_t threadsY)
 {
-  ::blocks = blocks;
-  ::threads = threads;
+  blocks.x = blocksX;
+  threads.x = threadsX;
+  threads.y = threadsY;
 }
 
 void gpuInit(const int32_t cache[][ColCodeCount][ColCodeCount],
@@ -134,10 +160,11 @@ void gpuGroup(int box2GroupSize, const uint16_t* box3List)
   bigTables->box3.alloc(box2GroupSize);
   bigTables->box3.copyTo(box3List);
 
-  bigTables->box7 .alloc(box2GroupSize);
-  bigTables->box11.alloc(box2GroupSize);
+  int32_t box711Size = ColCompatibleCount * ((box2GroupSize + CoalesceMaskLo) & CoalesceMaskHi);
+  bigTables->box711.alloc(box711Size);
+  bigTables->box711.clear();
 
-  bigTables->counts.alloc(box2GroupSize * blocks);
+  bigTables->counts.alloc(box2GroupSize * blocks.x);
   clearCounts<<<blocks, threads>>>(bigTables->counts.mem(), box2GroupSize);
 }
 
@@ -151,7 +178,7 @@ void gpuAddGroup(uint64_t* groupCounts, int groupStride)
   for (int groupIndex = 0; groupIndex < groupSize; ++groupIndex)
   {
     uint64_t count = 0;
-    for (int block = 0; block < blocks; ++block)
+    for (int block = 0; block < blocks.x; ++block)
       count += counts[block * groupSize + groupIndex];
     groupCounts[groupIndex * groupStride] += count;
   }
@@ -162,27 +189,29 @@ void gpuAddGroup(uint64_t* groupCounts, int groupStride)
 // *  Box7/Box11 Kernel  *
 // *                     *
 // ***********************
-
+//
+// gridDim.x must be a multiple of Coalesce
 __global__
 void box711(int groupSize, const uint16_t (*codeCompatTable)[ColCompatibleCount][2],
             const uint16_t* doubleRename0, const uint16_t* doubleRename1,
-            const uint16_t* box3List, uint16_t* box7, uint16_t* box11)
+            const uint16_t* box3List, Box711* box711)
 {
+  box711 += blockIdx.x & CoalesceMaskLo;
+
   for (int groupIndex = blockIdx.x; groupIndex < groupSize; groupIndex += gridDim.x)
   {
     int box3 = box3List[groupIndex];
     const uint16_t (*compat)[2] = codeCompatTable[box3];
 
-    uint16_t* box7Line  = box7  + groupIndex * ColCompatibleCount;
-    uint16_t* box11Line = box11 + groupIndex * ColCompatibleCount;
+    Box711* box711Line = box711 + ColCompatibleCount * (CoalesceMaskHi & groupIndex);
 
     for (int b3 = threadIdx.x; b3 < ColCompatibleCount; b3 += blockDim.x)
     {
       int b7  = compat[b3][0];
       int b11 = compat[b3][1];
-
-      box7Line [b3] = doubleRename0[b7 ];
-      box11Line[b3] = doubleRename1[b11];
+      Box711& bx = box711Line[b3 * Coalesce];
+      bx.box7  = doubleRename0[b7 ];
+      bx.box11 = doubleRename1[b11];
     }
   }
 }
@@ -197,10 +226,10 @@ __global__
 void groupCount(const uint16_t (*codeCompatTable)[2],
                 const uint16_t* doubleRename0, const uint16_t* doubleRename1,
                 const int32_t (*cache0)[ColCodeCount], const int32_t (*cache1)[ColCodeCount],
-                const uint16_t* box7, const uint16_t* box11,
-                int groupSize, int multiplier, uint64_t* counts)
+                const Box711* box711, int groupSize, int multiplier, uint64_t* counts)
 {
   uint64_t* p = counts + blockIdx.x * groupSize;
+  box711 += threadIdx.x & CoalesceMaskLo;
 
   for (int b2 = blockIdx.x; b2 < ColCompatibleCount; b2 += gridDim.x)
   {
@@ -215,11 +244,11 @@ void groupCount(const uint16_t (*codeCompatTable)[2],
 
     for (int groupIndex = threadIdx.x; groupIndex < groupSize; groupIndex += blockDim.x)
     {
-      const uint16_t* box7Line  = box7  + groupIndex * ColCompatibleCount;
-      const uint16_t* box11Line = box11 + groupIndex * ColCompatibleCount;
+      const Box711* box711Line  = box711 + (groupIndex & CoalesceMaskHi) * ColCompatibleCount;
       uint64_t count = 0;
-      for (int b3 = 0; b3 < ColCompatibleCount; ++b3)
-        count += (uint64_t)band1CacheLine[box7Line[b3]] * band2CacheLine[box11Line[b3]];
+      for (int b3 = 0; b3 < Coalesce * ColCompatibleCount; b3 += Coalesce)
+        count += (uint64_t)band1CacheLine[box711Line[b3].box7] * band2CacheLine[box711Line[b3].box11];
+
       p[groupIndex] += count * multiplier;
     }
   }
@@ -240,15 +269,14 @@ void gpuMainCount(int box01, int box2)
 
   int groupSize = bigTables->groupSize();
 
-  uint16_t* box7  = bigTables->box7 [0].data();
-  uint16_t* box11 = bigTables->box11[0].data();
+  Box711* box711List  = bigTables->box711.mem();
 
   const uint16_t* doubleRename0 = bigTables->gcPacketsDev[box01     ].doubleRename;
   const uint16_t* doubleRename1 = bigTables->gcPacketsDev[box01Other].doubleRename;
 
-  box711<<<blocks, threads>>>(groupSize, bigTables->codeCompatTableDev.mem(),
+  box711<<<64, 64>>>(groupSize, bigTables->codeCompatTableDev.mem(),
                               doubleRename0, doubleRename1, bigTables->box3.mem(),
-                              box7, box11);
+                              box711List);
   checkLaunch();
 
   const uint16_t (*codeCompatTable)[2] = bigTables->codeCompatTableDev[box2];
@@ -262,7 +290,7 @@ void gpuMainCount(int box01, int box2)
   //safeSync();
 
   groupCount<<<blocks, threads>>>(codeCompatTable, doubleRename0, doubleRename1,
-                                  cache0, cache1, box7, box11,
+                                  cache0, cache1, box711List,
                                   groupSize, multiplier, counts);
   checkLaunch();
   //safeSync();

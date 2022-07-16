@@ -46,7 +46,7 @@ void sudokudaEnd();
 
 // Set this number of blocks and theads to use for gpuGroup, gpuAddGroup, and gpuMainCount.
 // All three of those functions must use the same values.
-void gpuGrid(int blocks, int threads);
+void gpuGrid(uint32_t blocksX, uint32_t threadsX, uint32_t threadsY = 1);
 
 // Called in the GridCounter constructor to copy the bane counts in the gangster cache,
 // and the column code compatability table, to device memory.
@@ -67,6 +67,6 @@ void gpuGroup(int box2GroupSize, const uint16_t* box3List);
 void gpuAddGroup(uint64_t* groupCounts, int groupStride);
 
 // Main count looops to enumerate one GridCountPacket index (box01) for one box2 group
-void gpuMainCount(int box01, int box2);
+void gpuMainCount(int box01/*Start, int box01End*/, int box2);
 
 #endif

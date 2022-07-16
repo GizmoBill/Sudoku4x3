@@ -32,6 +32,8 @@
 
 #include "sudokuda.h"
 
+#include <vector>
+#include <array>
 #include <mutex>
 #include <fstream>
 #include <cmath>
@@ -3191,8 +3193,8 @@ void GridCounter::box2GroupIteration_(int runIndex, int threadIndex)
     int box01Other = gcp0.otherIndex;
     const GridCountPacket& gcp1 = gcPackets[box01Other];
 
-    std::vector<uint16_t[ColCompatible::Count]> box7 (box2GroupSize_);
-    std::vector<uint16_t[ColCompatible::Count]> box11(box2GroupSize_);
+    std::vector<std::array<uint16_t, ColCompatible::Count>> box7 (box2GroupSize_);
+    std::vector<std::array<uint16_t, ColCompatible::Count>> box11(box2GroupSize_);
     for (int groupIndex = 0; groupIndex < box2GroupSize_; ++groupIndex)
     {
       ColCode box3 = box2GroupBox3_[groupIndex];

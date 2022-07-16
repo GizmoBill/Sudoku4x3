@@ -112,6 +112,13 @@ public:
     cudaMemcpy(dst, this->mem_, this->numBytes(), cudaMemcpyDeviceToHost);
   }
 
+  // Warning: use only with types T where setting all bytes to 0 is valid
+  // needs static assert
+  void clear()
+  {
+    cudaMemset(this->mem_, 0, this->numBytes());
+  }
+
   void prefetchAsync()
   {
     int deviceId = cudaGetDevice(&deviceId);
