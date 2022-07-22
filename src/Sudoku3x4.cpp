@@ -28,7 +28,6 @@
 #include <profile.h>
 #include <rope.h>
 #include <general.h>
-#include <symmetrytable.h>
 
 #include "sudokuda.h"
 
@@ -1693,7 +1692,9 @@ class BandGang
 {
 public:
   // Each of the 9 cache levels, one for each nodeIndex
-  using CacheLevel = SymTable<int32_t, ColCode::Count, false>;
+  static constexpr int32_t ColCodeAligned = (ColCode::Count + CacheAlignMask) & ~CacheAlignMask;
+  using CacheLine = std::array<int32_t, ColCodeAligned>;
+  using CacheLevel = std::array<CacheLine, ColCode::Count>;
 
 private:
   // See like-named public member
@@ -1918,8 +1919,9 @@ BandGang::BandGang()
   }
 
   // Clear the cache
-  for (int i = 0; i < 9; ++i)
-    gangCache_[i].setAll(-1);
+  for (CacheLevel& level : gangCache_)
+    for (CacheLine& line : level)
+      line.fill(-1);
 
   ProfileTree::stop();
 }
@@ -1967,7 +1969,7 @@ double BandGang::cacheFill(int level) const
   const CacheLevel& cache = gangCache_[level];
   for (int c0 = 0; c0 < ColCode::Count; ++c0)
     for (int c1 = 0; c1 <= c0; ++c1)
-      n += (int)(cache.get(c0, c1) >= 0);
+      n += (int)(cache[c0][c1] >= 0);
   return (double)n / (ColCode::Count * (ColCode::Count + 1) / 2);
 }
 
@@ -1986,13 +1988,10 @@ void BandGang::fixCache_()
   for (int i = 0; i < size(); ++i)
     liveIndices[gangMembers().count(i)] = i;
 
-  for (int level = 0; level < 9; ++level)
-  {
-    CacheLevel& cache = gangCache_[level];
-    for (int c0 = 0; c0 < ColCode::Count; ++c0)
-      for (int c1 = c0; c1 < ColCode::Count; ++c1)
-        cache.set(c0, c1, liveIndices[cache.get(c0, c1)]);
-  }
+  for (CacheLevel& level : gangCache_)
+    for (CacheLine& line : level)
+      for (int32_t& g : line)
+        g = liveIndices[g];
 
   ProfileTree::stop(9 * ColCode::Count * ColCode::Count);
 }
@@ -2001,13 +2000,11 @@ void BandGang::replaceCacheCodesWithBandCounts()
 {
   ProfileTree::start("Replace cache codes");
 
-  for (int level = 0; level < 9; ++level)
-  {
-    CacheLevel& cache = gangCache_[level];
-    for (int c0 = 0; c0 < ColCode::Count; ++c0)
-      for (int c1 = c0; c1 < ColCode::Count; ++c1)
+  for (CacheLevel& level : gangCache_)
+    for (CacheLine& line : level)
+      for (int32_t& g : line)
       {
-        uint32_t gangIndex = (uint32_t)cache.get(c0, c1);   // unsigned compare
+        uint32_t gangIndex = (uint32_t)g;   // unsigned compare
         if (gangIndex >= GangNum)
           throw std::runtime_error("Bad gangster index in cache");
 
@@ -2015,9 +2012,8 @@ void BandGang::replaceCacheCodesWithBandCounts()
         if ((n & 7) != 0)
           throw std::runtime_error("Band count not divisible by 8");
 
-        cache.set(c0, c1, (int32_t)(n >> 3));
+        g = (int32_t)(n >> 3);
       }
-  }
 
   ProfileTree::stop(9 * ColCode::Count * ColCode::Count);
 }
@@ -2181,7 +2177,11 @@ int BandGang::gangIndex(Carton ct[4])
 
   // Update cache
   for (int b = 0; b < 4; ++b)
-    ct[b].cache->set(ct[b].boxes[1](), ct[b].boxes[2](), g);
+  {
+    int32_t x = ct[b].boxes[1]();
+    int32_t y = ct[b].boxes[2]();
+    (*ct[b].cache)[x][y] = (*ct[b].cache)[y][x] = g;
+  }
 
   return g;
 }
@@ -2199,7 +2199,7 @@ void BandGang::findIteration_(int box01, int threadIndex)
   for (ct[0].boxes[2] = ct[0].boxes[1]; ct[0].boxes[2].isValid(); ++ct[0].boxes[2])
   {
     // If Carton 0 hits the cache we're done with this b2
-    if (ct[0].cache->get(ct[0].boxes[1](), ct[0].boxes[2]()) >= 0)
+    if ((*ct[0].cache)[ct[0].boxes[1]()][ct[0].boxes[2]()] >= 0)
       continue;
 
     // If not, try the other cartons by mapping the other 3 boxes to 0
@@ -2213,11 +2213,15 @@ void BandGang::findIteration_(int box01, int threadIndex)
       ct[b].box0RepIndex = ColNode::nodes(ct[b].boxes[0]).repIndex;
       ct[b].cache = &gangCache_[ct[b].box0RepIndex];
 
-      int possibleGangIndex = ct[b].cache->get(ct[b].boxes[1](), ct[b].boxes[2]());
+      int possibleGangIndex = (*ct[b].cache)[ct[b].boxes[1]()][ct[b].boxes[2]()];
       if (possibleGangIndex >= 0)
       {
         for (int bb = 0; bb < b; ++bb)
-          ct[bb].cache->set(ct[bb].boxes[1](), ct[bb].boxes[2](), possibleGangIndex);
+        {
+          int32_t x = ct[bb].boxes[1]();
+          int32_t y = ct[bb].boxes[2]();
+          (*ct[bb].cache)[x][y] = (*ct[bb].cache)[y][x] = possibleGangIndex;
+       }
         goto cacheHit;
       }
     }
@@ -2379,15 +2383,15 @@ void BandGang::membersIteration_(int b1, int threadIndex)
   ColCode box0 = rename(box1, ColCode(0));
   const CacheLevel& cache = gangCache_[ColNode::nodes(box0).repIndex];
 
-  int gangIndex = cache.get(0, 0);
+  int gangIndex = cache[0][0];
   ++tempMembers_[threadIndex][gangIndex];
 
   for (int b2 = b1 + 1; b2 < ColCode::Count; ++b2)
   {
     ColCode box2 = rename(box1, ColCode(b2));
-    gangIndex = cache.get(0, box2());
+    gangIndex = cache[0][box2()];
     tempMembers_[threadIndex][gangIndex] += 3;
-    gangIndex = cache.get(box2(), box2());
+    gangIndex = cache[box2()][box2()];
     tempMembers_[threadIndex][gangIndex] += 3;
   }
 
@@ -2397,7 +2401,7 @@ void BandGang::membersIteration_(int b1, int threadIndex)
     for (int b3 = b2 + 1; b3 < ColCode::Count; ++b3)
     {
       ColCode box3 = rename(box1, ColCode(b3));
-      gangIndex = cache.get(box2(), box3());
+      gangIndex = cache[box2()][box3()];
       tempMembers_[threadIndex][gangIndex] += 6;
     }
   }
@@ -2707,6 +2711,13 @@ public:
   // Initialize internal gangser-independent table
   GridCounter(const BandGang& gang, bool gpuEnable);
 
+#ifdef JETSON
+  ~GridCounter()
+  {
+    GpuHost::sudokudaEnd();
+  }
+#endif
+
   // Count all gangsters in specified one of the 9 GangSets, using specified number of
   // threads, appending results as found to file countFileBase_gangSetMark.txt, where
   // gangSetMark is gangIndex followed by '-' if countBackwards. countBackwards means
@@ -2828,8 +2839,7 @@ GridCounter::GridCounter(const BandGang& gang, bool gpuEnable)
   if (gpuEnable)
   {
     ProfileTree::start("Band counts, compat table -> GPU");
-    gpuInit((int32_t (*)[ColCode::Count][ColCode::Count])&gang.cache(0),
-            (uint16_t(*)[ColCompatibleCount][2])codeCompatTable_);
+    GpuHost::gpuInit(&gang.cache(0), (uint16_t(*)[ColCompatible::Count][2])codeCompatTable_);
     ProfileTree::stop(9 * ColCode::Count * ColCode::Count);
   }
 #endif
@@ -3001,7 +3011,7 @@ void GridCounter::setup_(int gangSetIndex)
   if (gpuEnable_)
   {
     ProfileTree::start("Tables -> GPU");
-    gpuSetup(gcPackets);
+    GpuHost::gpuSetup(gcPackets);
     ProfileTree::stop();
   }
 #endif
@@ -3069,7 +3079,7 @@ void GridCounter::countIteration_(int gangOffset, int threadIndex)
       // data cache locality). Two memory references from the gangCache, good but not excellent locality.
       // One 64-bit multiply-accumulate.
       for (int b3 = 0; b3 < ColCompatible::Count; ++b3)
-        partialCount += (uint64_t)band1Cache->get(box6, box7[b3]) * band2Cache->get(box10, box11[b3]);
+        partialCount += (uint64_t)(*band1Cache)[box6][box7[b3]] * (*band2Cache)[box10][box11[b3]];
     }
 
     count += partialCount * gcp0.multiplier;
@@ -3182,7 +3192,7 @@ void GridCounter::box2GroupIteration_(int runIndex, int threadIndex)
 #ifdef JETSON
   if (gpuEnable_ && threadIndex == 0)
   {
-    gpuMainCount(box01, box2());
+    GpuHost::gpuMainCount(box01, box2());
   }
   else
 #endif
@@ -3216,8 +3226,8 @@ void GridCounter::box2GroupIteration_(int runIndex, int threadIndex)
       box6  = gcp0.doubleRename[box6 ];
       box10 = gcp1.doubleRename[box10];
 
-      const int32_t* band1CacheLine = gang_.cache(gcp0.cacheLevel).address(box6 , 0);
-      const int32_t* band2CacheLine = gang_.cache(gcp1.cacheLevel).address(box10, 0);
+      const int32_t* band1CacheLine = gang_.cache(gcp0.cacheLevel)[box6 ].data();
+      const int32_t* band2CacheLine = gang_.cache(gcp1.cacheLevel)[box10].data();
 
       for (int groupIndex = 0; groupIndex < box2GroupSize_; ++groupIndex)
       {
@@ -3291,7 +3301,7 @@ void GridCounter::box2GroupWrangler_()
     // Set gpu box2 group
 #ifdef JETSON
     if (gpuEnable_)
-      gpuGroup(box2GroupSize_, (const uint16_t*)box2GroupBox3_.data());
+      GpuHost::gpuGroup(box2GroupSize_, (const uint16_t*)box2GroupBox3_.data());
 #endif
 
     // Run all active box01 indices on all threads
@@ -3301,7 +3311,7 @@ void GridCounter::box2GroupWrangler_()
     // Add box2 group
 #ifdef JETSON
     if (gpuEnable_)
-      gpuAddGroup(box2GroupCounts_.data(), threadCount_);
+      GpuHost::gpuAddGroup(box2GroupCounts_.data(), threadCount_);
 #endif
 
     double secondsPerGangsterGroup = groupTimer.elapsedSeconds() / box2GroupSize_;
@@ -3825,7 +3835,7 @@ int main(int argc, char* argv[])
         sscanf(argv[i] + 1, "%d,%d", &gpuBlocks, &gpuThreads);
         if (1 <= gpuBlocks && gpuBlocks <= 256 && 1 <= gpuThreads && gpuThreads <= 1024)
         {
-          gpuGrid(gpuBlocks, gpuThreads);
+          GpuHost::gpuGrid(gpuBlocks, gpuThreads);
           printf("GPU using %d blocks, %d threads\n", gpuBlocks, gpuThreads);
         }
         else
@@ -3960,7 +3970,7 @@ int main(int argc, char* argv[])
 
       case '!':
 #ifdef JETSON
-        printDeviceProperties();
+        GpuHost::printDeviceProperties();
 #else
         printf("No GPU\n");
 #endif
@@ -4112,10 +4122,6 @@ int main(int argc, char* argv[])
         if (writeAll)
           Gangster::writeAll(gang, "sGang.txt");
       }
-
-#ifdef JETSON
-      sudokudaEnd();
-#endif
     }
 
     ProfileTree::stop();
