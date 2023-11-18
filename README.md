@@ -27,7 +27,16 @@ machines. My total running time is about 40% of Pettersen (1035 hours), all impr
 using every parallel thread of 2- and 4-core hyperthreaded 64-bit machines, and about 1.4 GB of
 lookup tables. This does make the present version simpler, which may add to its reliability.
 
-The code compiles and runs with MS Visual Studio C++ under Windows (x86 machines), and Eclipse/GCC under Ubuntu (x86 and ARM machines).Most of the counts were done on Windows machines, a few on Ubuntu. C++17 is required for filesystem access. It uses a commandline interface.
+While my original verification run consumed 1035 CPU-hours, the current version in the
+repository needs only 44.7 hours on my Jetson. This enormous speedup is almost entirely due
+to a reorganization of the counting loops that dramatically improves data cache hit rates,
+not due to the use of the GPU. The computation is memory bound with a memory
+access pattern that the Jetson's 8 ARM cores handle better than the 8 GPU streaming multiprocessors.
+The research log has details.
+
+The code compiles and runs with MS Visual Studio C++ under Windows (x86 machines), and Eclipse/GCC
+under Ubuntu (x86 and ARM machines). Most of the counts were done on Windows machines, a few on
+Ubuntu. C++17 is required for filesystem access. It uses a commandline interface.
 
 (Note: I wrote the Bignum package in about 1995 as my first C++ program and learning exercise,
 with a few modifications over the years. The style looks pretty awkward to me now, but it works,
