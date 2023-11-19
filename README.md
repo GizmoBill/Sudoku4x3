@@ -34,8 +34,8 @@ not due to the use of the GPU. The computation is memory bound with a memory
 access pattern that the Jetson's 8 ARM cores handle better than the 8 GPU streaming multiprocessors.
 The research log has details.
 
-The code compiles and runs with MS Visual Studio C++ under Windows (x86 machines), and Eclipse/GCC
-under Ubuntu (x86 and ARM machines). Most of the counts were done on Windows machines, a few on
+The code compiles and runs with MS Visual Studio C++ under Windows (x64 machines), and Eclipse/GCC
+under Ubuntu (x64 and ARM machines). Most of the counts were done on Windows machines, a few on
 Ubuntu. C++17 is required for filesystem access. It uses a commandline interface.
 
 (Note: I wrote the Bignum package in about 1995 as my first C++ program and learning exercise,
